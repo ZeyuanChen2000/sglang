@@ -10,12 +10,19 @@ from safetensors.torch import safe_open, save_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    BitsAndBytesConfig,
+)
 from sglang.multimodal_gen.runtime.loader import fsdp_load, rank_local_checkpoint
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 
 
 class _UniformDtypeModel(nn.Module):
     param_names_mapping = {}
+    # Every model the FSDP loader accepts declares its custom forward entry
+    # points, as BaseDiT and TextEncoder do; none here drive one.
+    _fsdp_forward_methods: tuple[str, ...] = ()
 
     def __init__(self) -> None:
         super().__init__()
@@ -34,7 +41,35 @@ class _ReplicatedLinearModel(_UniformDtypeModel):
         self.proj = ReplicatedLinear(4, 4, bias=False)
 
 
+class _CustomEntrypointModel(_UniformDtypeModel):
+    _fsdp_forward_methods = ("refine_prompt_embeds",)
+
+    def refine_prompt_embeds(self) -> None:
+        pass
+
+
+class _MetaBufferModel(_UniformDtypeModel):
+    """Mirrors cosmos3: a non-checkpoint buffer stays on meta until
+    post_load_weights() rebuilds it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = ReplicatedLinear(4, 4, bias=False)
+        self.register_buffer("inv_freq", torch.empty(2), persistent=False)
+
+    def post_load_weights(self) -> None:
+        if self.inv_freq.is_meta:
+            device = next(self.parameters()).device
+            self.register_buffer(
+                "inv_freq", torch.ones(2, device=device), persistent=False
+            )
+
+
 class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
+    def test_quant_config_detection_uses_the_runtime_instance(self):
+        self.assertTrue(fsdp_load._is_bitsandbytes_quant_config(BitsAndBytesConfig()))
+        self.assertFalse(fsdp_load._is_bitsandbytes_quant_config(Fp8Config()))
+
     def _load_and_capture_policy(
         self,
         model_cls: type[nn.Module],
@@ -105,6 +140,45 @@ class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
         shard_model.assert_not_called()
 
 
+class TestFSDPEntrypointRegistration(unittest.TestCase):
+    def _load_and_capture_registrations(self, model_cls: type[nn.Module]):
+        with (
+            patch.object(fsdp_load.current_platform, "is_mps", return_value=False),
+            patch.object(fsdp_load, "init_device_mesh", return_value=object()),
+            patch.object(fsdp_load, "shard_model"),
+            patch.object(
+                fsdp_load,
+                "safetensors_weights_iterator",
+                return_value=iter(()),
+            ),
+            patch.object(fsdp_load, "load_model_from_full_model_state_dict"),
+            patch.object(fsdp_load, "register_fsdp_forward_method") as register,
+        ):
+            model = fsdp_load.maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params={},
+                weight_dir_list=[],
+                device=torch.device("cpu"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                fsdp_inference=True,
+            )
+
+        return model, register
+
+    def test_declared_entry_points_are_registered(self):
+        model, register = self._load_and_capture_registrations(_CustomEntrypointModel)
+
+        register.assert_called_once_with(model, "refine_prompt_embeds")
+
+    def test_model_without_entry_points_registers_nothing(self):
+        _, register = self._load_and_capture_registrations(_UniformDtypeModel)
+
+        register.assert_not_called()
+
+
 class TestOrdinaryWeightLoading(unittest.TestCase):
     def test_direct_device_loading_skips_rank_local_cpu_checkpoint(self):
         load_plan = WeightLoadPlan(
@@ -139,6 +213,7 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
         rank_local_load.assert_not_called()
         weight_iterator.assert_called_once_with(
             ["model.safetensors"],
+            key_filter=None,
             weight_load_plan=load_plan,
         )
 
@@ -157,6 +232,35 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
         )
 
         self.assertEqual(model.proj.weight.data_ptr(), checkpoint_weight.data_ptr())
+        torch.testing.assert_close(model.proj.weight, checkpoint_weight)
+
+
+class TestDevicePostprocessMove(unittest.TestCase):
+    def test_postprocess_move_preserves_meta_buffers_for_post_load_weights(self):
+        # The pre-postprocess device move must not copy buffers that are
+        # still on meta awaiting post_load_weights() (cosmos3's RoPE inv_freq).
+        load_plan = WeightLoadPlan(
+            checkpoint_load_device=torch.device("cpu"),
+            weight_postprocess_device=torch.device("cpu"),
+        )
+        checkpoint_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        with patch.object(fsdp_load.current_platform, "is_mps", return_value=False):
+            model = fsdp_load.maybe_load_fsdp_model(
+                model_cls=_MetaBufferModel,
+                init_params={},
+                weight_dir_list=[],
+                device=torch.device("cpu"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                weight_load_plan=load_plan,
+                weights_iterator=iter((("proj.weight", checkpoint_weight),)),
+            )
+
+        self.assertFalse(model.inv_freq.is_meta)
+        torch.testing.assert_close(model.inv_freq, torch.ones(2))
         torch.testing.assert_close(model.proj.weight, checkpoint_weight)
 
 
